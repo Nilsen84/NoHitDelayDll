@@ -39,22 +39,10 @@ static constexpr const char *MINECRAFT_NAMES[] {
     } while (0)
 
 static struct InitState {
-    enum State { UNINITIALIZED, INITIALIZING, CLOSED, OPEN, CLAIMED };
-
-    std::atomic<State> state = UNINITIALIZED;
-    std::exception_ptr error;
+    std::atomic_flag started;
+    std::atomic_flag reportedSuccess;
     std::string minecraftName;
 } init;
-
-static std::string describeException() {
-    try {
-        throw;
-    } catch (const std::exception &ex) {
-        return ex.what();
-    } catch (...) {
-        return "unknown exception";
-    }
-}
 
 static std::pair<jclass, const char *> findMinecraftClass(jvmtiEnv *jvmti) {
     jint i;
@@ -94,9 +82,9 @@ static const char *getVM(JavaVM **vm) {
     return nullptr;
 }
 
-static void report(const char *title, const char *message) noexcept {
+static void report(const char *title, const char *message, bool error) noexcept {
 #ifdef _WIN32
-    MessageBoxA(nullptr, message, title, MB_OK);
+    MessageBoxA(nullptr, message, title, MB_OK | (error ? MB_ICONERROR : MB_ICONINFORMATION));
 #elif defined(__APPLE__)
     auto header = CFStringCreateWithCString(nullptr, title, kCFStringEncodingUTF8);
     auto body = CFStringCreateWithCString(nullptr, message, kCFStringEncodingUTF8);
@@ -105,12 +93,23 @@ static void report(const char *title, const char *message) noexcept {
         if (body) CFRelease(body);
     });
     if (!header || !body || CFUserNotificationDisplayAlert(
-            0, kCFUserNotificationNoteAlertLevel, nullptr, nullptr, nullptr,
+            0, error ? kCFUserNotificationStopAlertLevel : kCFUserNotificationNoteAlertLevel,
+            nullptr, nullptr, nullptr,
             header, body, CFSTR("OK"), nullptr, nullptr, nullptr) != 0)
         std::fprintf(stderr, "[NoHitDelay] %s: %s\n", title, message);
 #else
     std::fprintf(stderr, "[NoHitDelay] %s: %s\n", title, message);
 #endif
+}
+
+static void reportException() noexcept {
+    try {
+        throw;
+    } catch (const std::exception &ex) {
+        report("Error", ex.what(), true);
+    } catch (...) {
+        report("Error", "unknown exception", true);
+    }
 }
 
 static uint32_t applyPatch(std::span<uint8_t> data) {
@@ -162,28 +161,16 @@ static void JNICALL classFileLoadHook(
 ) noexcept {
     if (!class_being_redefined || !name || name != init.minecraftName) return;
 
-    char msg[256];
-    if (auto expected = init.OPEN; init.state.compare_exchange_strong(expected, init.CLAIMED)) {
-        try {
-            auto count = patchClass(jvmti_env, class_data_len, class_data, new_class_data_len, new_class_data);
-            std::snprintf(msg, sizeof(msg), "Applied patch to %s (%u replacements)", name, count);
-            report("Success", msg);
-        } catch (...) {
-            init.error = std::current_exception();
-        }
-        init.state.store(init.CLOSED);
-        init.state.notify_all();
-        return;
-    }
-
     try {
         auto count = patchClass(jvmti_env, class_data_len, class_data, new_class_data_len, new_class_data);
-        std::snprintf(msg, sizeof(msg), "Re-applied patch to %s (%u replacements)", name, count);
-        std::fprintf(stderr, "[NoHitDelay] %s\n", msg);
+        char msg[256];
+        std::snprintf(msg, sizeof(msg), "Applied patch to %s (%u replacements)", name, count);
+        if (!init.reportedSuccess.test_and_set())
+            report("Success", msg, false);
+        else
+            std::fprintf(stderr, "[NoHitDelay] %s\n", msg);
     } catch (...) {
-        auto error = "Failed to re-apply patch to " + init.minecraftName + ": " + describeException();
-        std::fprintf(stderr, "[NoHitDelay] %s\n", error.c_str());
-        jni_env->FatalError(error.c_str());
+        reportException();
     }
 }
 
@@ -201,29 +188,17 @@ static void load(jvmtiEnv *jvmti) {
     JVM_VERIFY(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr), "SetEventNotificationMode(JVMTI_ENABLE) failed");
     ScopeGuard disableHook([&] { jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, nullptr); });
 
-    init.state.store(init.OPEN);
-    auto err = jvmti->RetransformClasses(1, &minecraft);
-
-    auto expected = init.OPEN;
-    bool claimed = !init.state.compare_exchange_strong(expected, init.CLOSED);
-    if (claimed) init.state.wait(init.CLAIMED);
-
-    if (init.error) std::rethrow_exception(init.error);
-    JVM_VERIFY(err, "RetransformClasses failed");
-    if (!claimed) throw std::runtime_error("ClassFileLoadHook was never called for " + init.minecraftName);
+    JVM_VERIFY(jvmti->RetransformClasses(1, &minecraft), "RetransformClasses failed");
 
     disableHook.dismiss();
 }
 
 static void initialize() noexcept {
-    auto expected = init.UNINITIALIZED;
-    if (!init.state.compare_exchange_strong(expected, init.INITIALIZING)) return;
-    // An initialization attempt is one-shot, even if it fails.
-    ScopeGuard close([&] { init.state.store(init.CLOSED); });
+    if (init.started.test_and_set()) return;
 
     JavaVM *vm;
     if (auto err = getVM(&vm)) {
-        report("Failed to find running JVM", err);
+        report("Failed to find running JVM", err, true);
         return;
     }
 
@@ -236,7 +211,7 @@ static void initialize() noexcept {
         JVM_VERIFY(vm->GetEnv((void **) &jvmti, JVMTI_VERSION_1_2), "GetEnv failed");
         load(jvmti);
     } catch (...) {
-        report("Error", describeException().c_str());
+        reportException();
     }
 }
 
