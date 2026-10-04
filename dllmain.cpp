@@ -38,7 +38,7 @@ static constexpr std::string_view MINECRAFT_NAMES[] {
             throw std::runtime_error(std::format("{} (error {})", message, static_cast<int>(jvmVerifyErr))); \
     } while (0)
 
-static struct InitState {
+static constinit struct {
     std::atomic_flag started;
     std::atomic_flag reportedSuccess;
     std::string_view minecraftName;
@@ -235,13 +235,19 @@ static void *threadMain(void *) {
     return nullptr;
 }
 
-extern "C" __attribute__((visibility("default"))) int NoHitDelay_Initialize() noexcept {
+static bool startThread() noexcept {
     pthread_attr_t attributes;
-    if (pthread_attr_init(&attributes) != 0) return JNI_ERR;
+    if (pthread_attr_init(&attributes) != 0) return false;
     ScopeGuard destroyAttributes([&] { pthread_attr_destroy(&attributes); });
-    if (pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) != 0) return JNI_ERR;
+    if (pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) != 0) return false;
     pthread_t thread;
-    if (pthread_create(&thread, &attributes, threadMain, nullptr) != 0) return JNI_ERR;
-    return JNI_OK;
+    return pthread_create(&thread, &attributes, threadMain, nullptr) == 0;
 }
+
+static struct AutoInitialize {
+    AutoInitialize() noexcept {
+        if (!startThread())
+            report("Error", "Failed to start initialization thread", true);
+    }
+} autoInitialize;
 #endif

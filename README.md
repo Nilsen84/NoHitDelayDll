@@ -17,8 +17,8 @@ Requires a C++20 compiler and a JDK for the JNI headers.
 
 Windows: inject the DLL into a running game.
 
-macOS/Linux: load the shared library and call `NoHitDelay_Initialize()` once
-after Minecraft has loaded. This starts a worker thread that finds the running JVM.
+macOS/Linux: load the shared library after Minecraft has loaded.
+Initialization starts automatically on a worker thread.
 Keep the library loaded for the lifetime of the process.
 
 On macOS/Linux, run `build/inject.sh [pid]`; omit the PID to select a Java process.

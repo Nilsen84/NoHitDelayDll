@@ -54,6 +54,5 @@ lldb_path=${lldb_path//\"/\\\"}
 exec "${debugger[@]}" --no-lldbinit --batch \
     -o "process attach --pid $pid" \
     -o "process load \"$lldb_path\"" \
-    -o 'expression -- ((int (*)())NoHitDelay_Initialize)()' \
     -o 'process detach' \
     -o quit
