@@ -1,8 +1,8 @@
 # NoHitDelayDll
 
-Removes the hit delay (the cooldown after a missed left-click) in Minecraft 1.8.9. Inject the DLL into a running game.
+Removes the hit delay (the cooldown after a missed left-click) in Minecraft 1.8.9.
 
-Supports vanilla, MCP/Forge and Legacy Fabric mappings.
+Supports Windows, macOS and Linux with vanilla, MCP/Forge and Legacy Fabric mappings.
 
 ## Building
 
@@ -11,4 +11,15 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel
 cmake --build build
 ```
 
-Requires a JDK for the JNI headers
+Requires a C++20 compiler and a JDK for the JNI headers.
+
+## Loading
+
+Windows: inject the DLL into a running game.
+
+macOS/Linux: load the shared library and call `NoHitDelay_Initialize()` once
+after Minecraft has loaded. This starts a worker thread that finds the running JVM.
+Keep the library loaded for the lifetime of the process.
+
+On macOS/Linux, run `build/inject.sh [pid]`; omit the PID to select a Java process.
+Linux requires LLDB and may require `sudo` depending on ptrace restrictions.

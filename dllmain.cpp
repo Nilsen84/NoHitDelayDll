@@ -1,8 +1,18 @@
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <pthread.h>
+#endif
+
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <format>
@@ -29,9 +39,9 @@ static constexpr const char *MINECRAFT_NAMES[] {
     } while (0)
 
 static struct InitState {
-    static constexpr int CLOSED = 0, OPEN = 1, CLAIMED = 2;
+    enum State { UNINITIALIZED, INITIALIZING, CLOSED, OPEN, CLAIMED };
 
-    std::atomic<int> state = CLOSED;
+    std::atomic<State> state = UNINITIALIZED;
     std::exception_ptr error;
     std::string minecraftName;
 } init;
@@ -67,16 +77,40 @@ static std::pair<jclass, const char *> findMinecraftClass(jvmtiEnv *jvmti) {
     return {nullptr, nullptr};
 }
 
-static const wchar_t* getVM(JavaVM **vm) {
+static const char *getVM(JavaVM **vm) {
+#ifdef _WIN32
     auto handle = GetModuleHandleW(L"jvm.dll");
-    if (!handle) return L"jvm.dll not found";
+    if (!handle) return "jvm.dll not found";
     auto addr = reinterpret_cast<decltype(&JNI_GetCreatedJavaVMs)>(GetProcAddress(handle, "JNI_GetCreatedJavaVMs"));
-    if (!addr) return L"JNI_GetCreatedJavaVMs not found";
+#else
+    auto addr = reinterpret_cast<decltype(&JNI_GetCreatedJavaVMs)>(
+        dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
+#endif
+    if (!addr) return "JNI_GetCreatedJavaVMs not found";
 
     if (jsize count; addr(vm, 1, &count) != JNI_OK || count == 0)
-        return L"JNI_GetCreatedJavaVMs failed";
+        return "JNI_GetCreatedJavaVMs failed";
 
     return nullptr;
+}
+
+static void report(const char *title, const char *message) noexcept {
+#ifdef _WIN32
+    MessageBoxA(nullptr, message, title, MB_OK);
+#elif defined(__APPLE__)
+    auto header = CFStringCreateWithCString(nullptr, title, kCFStringEncodingUTF8);
+    auto body = CFStringCreateWithCString(nullptr, message, kCFStringEncodingUTF8);
+    ScopeGuard releaseStrings([&] {
+        if (header) CFRelease(header);
+        if (body) CFRelease(body);
+    });
+    if (!header || !body || CFUserNotificationDisplayAlert(
+            0, kCFUserNotificationNoteAlertLevel, nullptr, nullptr, nullptr,
+            header, body, CFSTR("OK"), nullptr, nullptr, nullptr) != 0)
+        std::fprintf(stderr, "[NoHitDelay] %s: %s\n", title, message);
+#else
+    std::fprintf(stderr, "[NoHitDelay] %s: %s\n", title, message);
+#endif
 }
 
 static uint32_t applyPatch(std::span<uint8_t> data) {
@@ -129,11 +163,11 @@ static void JNICALL classFileLoadHook(
     if (!class_being_redefined || !name || name != init.minecraftName) return;
 
     char msg[256];
-    if (int expected = init.OPEN; init.state.compare_exchange_strong(expected, init.CLAIMED)) {
+    if (auto expected = init.OPEN; init.state.compare_exchange_strong(expected, init.CLAIMED)) {
         try {
             auto count = patchClass(jvmti_env, class_data_len, class_data, new_class_data_len, new_class_data);
             std::snprintf(msg, sizeof(msg), "Applied patch to %s (%u replacements)", name, count);
-            MessageBoxA(nullptr, msg, "Success", MB_OK);
+            report("Success", msg);
         } catch (...) {
             init.error = std::current_exception();
         }
@@ -148,7 +182,7 @@ static void JNICALL classFileLoadHook(
         std::fprintf(stderr, "[NoHitDelay] %s\n", msg);
     } catch (...) {
         auto error = "Failed to re-apply patch to " + init.minecraftName + ": " + describeException();
-        std::fprintf(stderr, "[NoHitDelay] %s\n", msg);
+        std::fprintf(stderr, "[NoHitDelay] %s\n", error.c_str());
         jni_env->FatalError(error.c_str());
     }
 }
@@ -170,7 +204,7 @@ static void load(jvmtiEnv *jvmti) {
     init.state.store(init.OPEN);
     auto err = jvmti->RetransformClasses(1, &minecraft);
 
-    int expected = init.OPEN;
+    auto expected = init.OPEN;
     bool claimed = !init.state.compare_exchange_strong(expected, init.CLOSED);
     if (claimed) init.state.wait(init.CLAIMED);
 
@@ -181,11 +215,16 @@ static void load(jvmtiEnv *jvmti) {
     disableHook.dismiss();
 }
 
-static DWORD WINAPI threadMain(LPVOID) {
+static void initialize() noexcept {
+    auto expected = init.UNINITIALIZED;
+    if (!init.state.compare_exchange_strong(expected, init.INITIALIZING)) return;
+    // An initialization attempt is one-shot, even if it fails.
+    ScopeGuard close([&] { init.state.store(init.CLOSED); });
+
     JavaVM *vm;
     if (auto err = getVM(&vm)) {
-        MessageBoxW(nullptr, err, L"Failed to find running JVM", MB_OK);
-        return 1;
+        report("Failed to find running JVM", err);
+        return;
     }
 
     try {
@@ -197,10 +236,13 @@ static DWORD WINAPI threadMain(LPVOID) {
         JVM_VERIFY(vm->GetEnv((void **) &jvmti, JVMTI_VERSION_1_2), "GetEnv failed");
         load(jvmti);
     } catch (...) {
-        MessageBoxA(nullptr, describeException().c_str(), "Error", MB_OK);
-        return 1;
+        report("Error", describeException().c_str());
     }
+}
 
+#ifdef _WIN32
+static DWORD WINAPI threadMain(LPVOID) {
+    initialize();
     return 0;
 }
 
@@ -216,3 +258,20 @@ BOOL WINAPI DllMain(HMODULE module, DWORD fdwReason, LPVOID) {
     }
     return TRUE;
 }
+
+#else
+static void *threadMain(void *) {
+    initialize();
+    return nullptr;
+}
+
+extern "C" __attribute__((visibility("default"))) int NoHitDelay_Initialize() noexcept {
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes) != 0) return JNI_ERR;
+    ScopeGuard destroyAttributes([&] { pthread_attr_destroy(&attributes); });
+    if (pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) != 0) return JNI_ERR;
+    pthread_t thread;
+    if (pthread_create(&thread, &attributes, threadMain, nullptr) != 0) return JNI_ERR;
+    return JNI_OK;
+}
+#endif
