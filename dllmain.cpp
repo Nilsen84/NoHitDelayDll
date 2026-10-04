@@ -27,7 +27,7 @@
 
 #include "scope_guard.h"
 
-static constexpr const char *MINECRAFT_NAMES[] {
+static constexpr std::string_view MINECRAFT_NAMES[] {
     "net/minecraft/client/Minecraft", // mcp
     "net/minecraft/class_1600",       // legacy fabric
     "ave",                            // notch
@@ -41,10 +41,10 @@ static constexpr const char *MINECRAFT_NAMES[] {
 static struct InitState {
     std::atomic_flag started;
     std::atomic_flag reportedSuccess;
-    std::string minecraftName;
+    std::string_view minecraftName;
 } init;
 
-static std::pair<jclass, const char *> findMinecraftClass(jvmtiEnv *jvmti) {
+static std::pair<jclass, std::string_view> findMinecraftClass(jvmtiEnv *jvmti) {
     jint i;
     jclass *classes;
     JVM_VERIFY(jvmti->GetLoadedClasses(&i, &classes), "GetLoadedClasses failed");
@@ -62,7 +62,7 @@ static std::pair<jclass, const char *> findMinecraftClass(jvmtiEnv *jvmti) {
         if (match != std::end(MINECRAFT_NAMES)) return {classes[i], *match};
     }
 
-    return {nullptr, nullptr};
+    return {nullptr, {}};
 }
 
 static const char *getVM(JavaVM **vm) {
@@ -129,24 +129,6 @@ static uint32_t applyPatch(std::span<uint8_t> data) {
     return count;
 }
 
-static uint32_t patchClass(jvmtiEnv *jvmti, jint len, const unsigned char *data, jint *newLen, unsigned char **newData) {
-    static constexpr uint32_t EXPECTED_PATCHES = 2;
-
-    unsigned char *out;
-    JVM_VERIFY(jvmti->Allocate(len, &out), "Allocate failed");
-    ScopeGuard freeOut([&] { jvmti->Deallocate(out); });
-
-    memcpy(out, data, len);
-    auto count = applyPatch({out, static_cast<size_t>(len)});
-    if (count != EXPECTED_PATCHES)
-        throw std::runtime_error(std::format("Expected {} replacements, got {}", EXPECTED_PATCHES, count));
-
-    freeOut.dismiss();
-    *newData = out;
-    *newLen = len;
-    return count;
-}
-
 static void JNICALL classFileLoadHook(
     jvmtiEnv *jvmti_env,
     JNIEnv *jni_env,
@@ -162,13 +144,26 @@ static void JNICALL classFileLoadHook(
     if (!class_being_redefined || !name || name != init.minecraftName) return;
 
     try {
-        auto count = patchClass(jvmti_env, class_data_len, class_data, new_class_data_len, new_class_data);
-        char msg[256];
-        std::snprintf(msg, sizeof(msg), "Applied patch to %s (%u replacements)", name, count);
+        static constexpr uint32_t EXPECTED_PATCHES = 2;
+
+        unsigned char *patched;
+        JVM_VERIFY(jvmti_env->Allocate(class_data_len, &patched), "Allocate failed");
+        ScopeGuard freePatched([&] { jvmti_env->Deallocate(patched); });
+
+        memcpy(patched, class_data, class_data_len);
+        auto count = applyPatch({patched, static_cast<size_t>(class_data_len)});
+        if (count != EXPECTED_PATCHES)
+            throw std::runtime_error(std::format("Expected {} replacements, got {}", EXPECTED_PATCHES, count));
+
+        auto msg = std::format("Applied patch to {} ({} replacements)", name, count);
         if (!init.reportedSuccess.test_and_set())
-            report("Success", msg, false);
+            report("Success", msg.c_str(), false);
         else
-            std::fprintf(stderr, "[NoHitDelay] %s\n", msg);
+            std::fprintf(stderr, "[NoHitDelay] %s\n", msg.c_str());
+
+        *new_class_data = patched;
+        *new_class_data_len = class_data_len;
+        freePatched.dismiss();
     } catch (...) {
         reportException();
     }
